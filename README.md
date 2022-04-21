@@ -1,2 +1,2 @@
-# alexa_python
-python artificial intelligence
+# ALEXA
+ Artificial Intelligence sample project
