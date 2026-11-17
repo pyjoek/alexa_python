@@ -1,12 +1,22 @@
 #!/usr/bin/env python3
 """
 Local-LLM voice assistant (rebuild of alexa_python)
-Uses Ollama for thinking instead of cloud services + hardcoded rules.
+
+Features:
+- Brain = your local Ollama model
+- Wake-word mode ("Jarvis")
+- Optional fully-offline STT via faster-whisper
+- Expandable local tools
+- Short conversation memory
 """
 
+from __future__ import annotations
+
 import datetime
-import json
+import platform
+import random
 import re
+import shutil
 import subprocess
 import webbrowser
 from typing import Optional
@@ -15,88 +25,155 @@ import ollama
 import pyttsx3
 import speech_recognition as sr
 
-# ----------------------------------------------------------------------------
-# Config — change these to match your local setup
-# ----------------------------------------------------------------------------
+# =============================================================================
+# CONFIG — edit these
+# =============================================================================
 OLLAMA_HOST = "http://127.0.0.1:11434"
-MODEL = "qwen2.5:1.5b"          # or qwen3:4b, llama3.2, etc.
+MODEL = "qwen2.5:1.5b"              # change to whatever you pulled
+STT_ENGINE = "google"               # "google" or "whisper"
+WAKE_WORD = "jarvis"                # say this to activate
 OWNER_NAME = "Joel"
 ASSISTANT_NAME = "Jarvis"
 
-SYSTEM_PROMPT = f"""You are {ASSISTANT_NAME}, a concise and helpful voice assistant for {OWNER_NAME}.
-You run completely offline on his local machine.
+# Whisper settings (only used if STT_ENGINE == "whisper")
+WHISPER_MODEL = "base"              # tiny / base / small / medium
+WHISPER_DEVICE = "cpu"              # "cpu" or "cuda"
 
-Personality:
-- Direct, calm, slightly dry sense of humour
-- Keep spoken answers short (1-3 sentences) unless he asks for detail
-- Never invent facts about him
+SYSTEM_PROMPT = f"""You are {ASSISTANT_NAME}, a concise personal voice assistant for {OWNER_NAME}.
+You run 100% locally on his machine using Ollama.
 
-You can use these tools by writing exactly one of these lines when needed:
+Style:
+- Calm, direct, slightly dry humour
+- Keep spoken replies short (1–3 sentences) unless he asks for more
+- Never invent personal facts about him
+
+Available tools — when you need one, reply with EXACTLY one of these lines and nothing else:
 TOOL: get_time
 TOOL: lock_screen
 TOOL: open_google
 TOOL: open_youtube
+TOOL: open_url <url>
 TOOL: tell_joke
+TOOL: system_info
 TOOL: exit
 
-Otherwise just reply normally in plain text. Do not explain the tools.
+If no tool is needed, just answer in normal English.
 """
 
-# ----------------------------------------------------------------------------
-# Voice I/O
-# ----------------------------------------------------------------------------
+# =============================================================================
+# Voice output (fully offline)
+# =============================================================================
 engine = pyttsx3.init()
 voices = engine.getProperty("voices")
-# Prefer a female/clear voice if available
 if len(voices) > 1:
     engine.setProperty("voice", voices[1].id)
 engine.setProperty("rate", 165)
 
 
-def speak(text: str):
+def speak(text: str) -> None:
     print(f"{ASSISTANT_NAME}: {text}")
     engine.say(text)
     engine.runAndWait()
 
 
-def listen() -> Optional[str]:
+# =============================================================================
+# Speech-to-text
+# =============================================================================
+_whisper_model = None
+
+
+def _load_whisper():
+    global _whisper_model
+    if _whisper_model is not None:
+        return _whisper_model
+    try:
+        from faster_whisper import WhisperModel
+        print(f"Loading Whisper model '{WHISPER_MODEL}' on {WHISPER_DEVICE}...")
+        _whisper_model = WhisperModel(WHISPER_MODEL, device=WHISPER_DEVICE, compute_type="int8")
+        return _whisper_model
+    except ImportError:
+        speak("faster-whisper is not installed. Falling back to Google speech recognition.")
+        return None
+    except Exception as e:
+        speak(f"Could not load Whisper: {e}. Falling back to Google.")
+        return None
+
+
+def listen(timeout: float = 8, phrase_limit: float = 12) -> Optional[str]:
+    """Capture one utterance and return the transcript."""
     r = sr.Recognizer()
     with sr.Microphone() as source:
-        r.pause_threshold = 0.8
-        r.adjust_for_ambient_noise(source, duration=0.4)
+        r.pause_threshold = 0.7
+        r.adjust_for_ambient_noise(source, duration=0.3)
         print("Listening...")
         try:
-            audio = r.listen(source, timeout=8, phrase_time_limit=12)
+            audio = r.listen(source, timeout=timeout, phrase_time_limit=phrase_limit)
         except sr.WaitTimeoutError:
             return None
 
+    # ---- Local Whisper path ----
+    if STT_ENGINE == "whisper":
+        model = _load_whisper()
+        if model is not None:
+            try:
+                # speech_recognition gives us WAV data in memory
+                import io
+                import wave
+                raw = io.BytesIO(audio.get_wav_data())
+                segments, _ = model.transcribe(raw, language="en", beam_size=1)
+                text = " ".join(seg.text for seg in segments).strip()
+                if text:
+                    print(f"You: {text}")
+                    return text
+                return None
+            except Exception as e:
+                print(f"Whisper error: {e}")
+                # fall through to Google
+
+    # ---- Google path (default) ----
     try:
-        # Still using Google STT for accuracy.
-        # Later you can swap this for local Whisper / Vosk.
-        query = r.recognize_google(audio, language="en-in")
-        print(f"You: {query}")
-        return query.strip()
+        text = r.recognize_google(audio, language="en-in")
+        print(f"You: {text}")
+        return text.strip()
     except sr.UnknownValueError:
-        speak("I didn't catch that. Can you say it again?")
         return None
     except sr.RequestError:
-        speak("Speech recognition needs internet right now. Check your connection.")
+        speak("Speech service needs internet right now.")
         return None
 
 
-# ----------------------------------------------------------------------------
-# Local tools the model can call
-# ----------------------------------------------------------------------------
+def listen_for_wake_word() -> bool:
+    """Block until the wake word is heard. Returns True when detected."""
+    print(f"Waiting for wake word '{WAKE_WORD}'...")
+    r = sr.Recognizer()
+    with sr.Microphone() as source:
+        r.pause_threshold = 0.5
+        r.adjust_for_ambient_noise(source, duration=0.3)
+        while True:
+            try:
+                audio = r.listen(source, timeout=None, phrase_time_limit=3)
+                try:
+                    text = r.recognize_google(audio, language="en-in").lower()
+                    print(f"(heard: {text})")
+                    if WAKE_WORD in text:
+                        return True
+                except (sr.UnknownValueError, sr.RequestError):
+                    continue
+            except Exception:
+                continue
+
+
+# =============================================================================
+# Local tools
+# =============================================================================
 def get_time() -> str:
-    now = datetime.datetime.now().strftime("%I:%M %p")
-    return f"The time is {now}"
+    return f"The time is {datetime.datetime.now().strftime('%I:%M %p')}"
 
 
 def lock_screen() -> str:
     try:
-        # Works on most Linux desktops
         subprocess.run(["loginctl", "lock-session"], check=False)
-        return "Locking the screen."
+        return "Locking the screen now."
     except Exception:
         return "I couldn't lock the screen on this system."
 
@@ -111,119 +188,144 @@ def open_youtube() -> str:
     return "Opening YouTube."
 
 
+def open_url(url: str) -> str:
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+    webbrowser.open(url)
+    return f"Opening {url}"
+
+
 def tell_joke() -> str:
     jokes = [
         "Why do programmers prefer dark mode? Because light attracts bugs.",
-        "There are only 10 kinds of people in the world: those who understand binary and those who don't.",
+        "There are only 10 kinds of people: those who understand binary and those who don't.",
         "A SQL query walks into a bar, walks up to two tables and asks: Can I join you?",
-        "Why did the developer go broke? Because he used up all his cache.",
+        "Why did the developer go broke? He used up all his cache.",
+        "I would tell you a UDP joke, but you might not get it.",
     ]
-    import random
     return random.choice(jokes)
 
 
+def system_info() -> str:
+    uname = platform.uname()
+    try:
+        import psutil
+        cpu = psutil.cpu_percent(interval=0.5)
+        mem = psutil.virtual_memory()
+        disk = psutil.disk_usage("/")
+        return (
+            f"Running {uname.system} {uname.release} on {uname.machine}. "
+            f"CPU {cpu} percent, memory {mem.percent} percent used, "
+            f"disk {disk.percent} percent used."
+        )
+    except ImportError:
+        return f"System: {uname.system} {uname.release} ({uname.machine}). Install psutil for more details."
+
+
 TOOLS = {
-    "get_time": get_time,
-    "lock_screen": lock_screen,
-    "open_google": open_google,
-    "open_youtube": open_youtube,
-    "tell_joke": tell_joke,
+    "get_time": lambda: get_time(),
+    "lock_screen": lambda: lock_screen(),
+    "open_google": lambda: open_google(),
+    "open_youtube": lambda: open_youtube(),
+    "tell_joke": lambda: tell_joke(),
+    "system_info": lambda: system_info(),
 }
 
 
-def run_tool(name: str) -> str:
+def run_tool(raw: str) -> str:
+    """raw is the full TOOL: line, e.g. 'open_url https://example.com'"""
+    parts = raw.strip().split(maxsplit=1)
+    name = parts[0].lower()
+    arg = parts[1] if len(parts) > 1 else ""
+
+    if name == "open_url":
+        return open_url(arg) if arg else "Please give me a URL."
+    if name == "exit":
+        return "__EXIT__"
     fn = TOOLS.get(name)
     if not fn:
         return f"I don't know the tool '{name}'."
     return fn()
 
 
-# ----------------------------------------------------------------------------
-# LLM brain (Ollama)
-# ----------------------------------------------------------------------------
+# =============================================================================
+# LLM brain
+# =============================================================================
 client = ollama.Client(host=OLLAMA_HOST)
-
-history = [
-    {"role": "system", "content": SYSTEM_PROMPT},
-]
+history: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
 
 
 def ask_llm(user_text: str) -> str:
     history.append({"role": "user", "content": user_text})
 
     try:
-        response = client.chat(
+        resp = client.chat(
             model=MODEL,
             messages=history,
-            options={
-                "temperature": 0.6,
-                "num_ctx": 4096,
-            },
+            options={"temperature": 0.55, "num_ctx": 4096},
         )
-        reply = response["message"]["content"].strip()
+        reply = resp["message"]["content"].strip()
     except Exception as e:
-        reply = f"I can't reach the local model right now. Is Ollama running? ({e})"
+        reply = f"I can't reach the local model. Is Ollama running? ({e})"
 
-    # Keep history reasonable
-    if len(history) > 16:
-        # keep system + last few turns
-        history[:] = [history[0]] + history[-10:]
+    # Keep history short
+    if len(history) > 14:
+        history[:] = [history[0]] + history[-8:]
 
     history.append({"role": "assistant", "content": reply})
     return reply
 
 
 def extract_tool(reply: str) -> Optional[str]:
-    """Look for TOOL: name in the model reply."""
-    match = re.search(r"TOOL:\s*(\w+)", reply, re.IGNORECASE)
+    match = re.search(r"TOOL:\s*(.+)", reply, re.IGNORECASE)
     if match:
-        return match.group(1).lower()
+        return match.group(1).strip()
     return None
 
 
-# ----------------------------------------------------------------------------
+# =============================================================================
 # Main loop
-# ----------------------------------------------------------------------------
-def main():
+# =============================================================================
+def main() -> None:
     hour = datetime.datetime.now().hour
-    if hour < 12:
-        greet = "Good morning"
-    elif hour < 18:
-        greet = "Good afternoon"
-    else:
-        greet = "Good evening"
+    greet = "Good morning" if hour < 12 else "Good afternoon" if hour < 18 else "Good evening"
 
-    speak(f"{greet}, {OWNER_NAME}. {ASSISTANT_NAME} is online and running fully local.")
+    speak(f"{greet}, {OWNER_NAME}. {ASSISTANT_NAME} is online and fully local.")
 
     while True:
-        query = listen()
+        # 1. Wait for wake word
+        listen_for_wake_word()
+        speak("Yes?")
+
+        # 2. Listen for the actual command
+        query = listen(timeout=10, phrase_limit=15)
         if not query:
+            speak("I didn't catch that.")
             continue
 
         lower = query.lower()
 
-        # Quick local exits (don't even bother the model)
-        if any(w in lower for w in ("exit", "quit", "goodbye", "shut down", "stop listening")):
-            speak("Goodbye. Going offline.")
+        # Quick local exit without bothering the model
+        if any(w in lower for w in ("exit", "quit", "goodbye", "shut down", "go to sleep")):
+            speak("Going offline. Goodbye.")
             break
 
-        # Ask the local LLM
+        # 3. Ask the local LLM
         reply = ask_llm(query)
 
-        # Check if the model wants a tool
-        tool_name = extract_tool(reply)
-        if tool_name:
-            if tool_name == "exit":
-                speak("Goodbye.")
+        # 4. Tool or normal reply
+        tool_raw = extract_tool(reply)
+        if tool_raw:
+            result = run_tool(tool_raw)
+            if result == "__EXIT__":
+                speak("Going offline. Goodbye.")
                 break
-            tool_result = run_tool(tool_name)
-            speak(tool_result)
-            # Optional: feed the tool result back so the model knows it happened
-            history.append({"role": "user", "content": f"[tool result] {tool_result}"})
-            history.append({"role": "assistant", "content": tool_result})
+            speak(result)
+            # Feed result back so the model knows what happened
+            history.append({"role": "user", "content": f"[tool result] {result}"})
+            history.append({"role": "assistant", "content": result})
         else:
-            # Clean any leftover TOOL: lines just in case
-            clean = re.sub(r"TOOL:\s*\w+", "", reply).strip()
+            clean = re.sub(r"TOOL:\s*.+", "", reply).strip()
             if clean:
                 speak(clean)
 

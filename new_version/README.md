@@ -1,69 +1,85 @@
 # Alexa Python — New Version (Local LLM)
 
-This is a full rebuild of the original voice assistant.
+Full rebuild of the original voice assistant.
 
-**Old version problems:**
-- Hardcoded `if/elif` for every command
-- Relied on cloud services (Google Speech, Wikipedia, pywhatkit/YouTube, etc.)
-- No real conversation ability
-
-**New version:**
-- Uses **your local Ollama model** as the brain
-- Free-form conversation (not just keyword matching)
-- Keeps speech recognition + text-to-speech
-- Local tools only (time, lock screen, open sites, jokes, etc.)
-- Conversation history so it remembers what you said
+**Key improvements over the original:**
+- Brain runs on **your local Ollama model** (no Wikipedia / pywhatkit / cloud APIs for thinking)
+- Free conversation + short-term memory
+- Optional **wake word** ("Jarvis") so it doesn't listen all the time
+- Optional **local Whisper** speech-to-text (fully offline)
+- Expandable local tools
 
 ## Requirements
 
-1. Ollama running locally (you already have this from `local_LLM`)
-2. A model pulled (recommended: `qwen2.5:1.5b` or `qwen3:4b`)
-
+### 1. Ollama (you already have this)
 ```bash
-# If Ollama is not already running
-docker run -d --name ollama --restart unless-stopped -p 127.0.0.1:11434:11434 -v ollama:/root/.ollama ollama/ollama
-
-# Pull a model if needed
+# Make sure a model is pulled
 docker exec -it ollama ollama pull qwen2.5:1.5b
+# or a stronger one if you have RAM: qwen3:4b / llama3.2:3b etc.
 ```
 
-## Install Python packages
-
+### 2. Python packages
 ```bash
 cd new_version
 pip install -r requirements.txt
 ```
 
-> Note: `pyaudio` can be annoying on Linux. If it fails:
+> On Linux if `pyaudio` fails:
 > ```bash
 > sudo apt install portaudio19-dev python3-pyaudio
 > ```
 
-## Run
+### Optional: Local Whisper (fully offline STT)
+```bash
+pip install faster-whisper
+```
+Then set `STT_ENGINE = "whisper"` in `assistant.py`.
+
+## How to run
 
 ```bash
 python assistant.py
 ```
 
-It will greet you, then listen continuously.
-Say **"exit"**, **"quit"** or **"goodbye"** to stop.
+By default it starts in **wake-word mode**:
+- It waits silently until you say **"Jarvis"**
+- Then it listens for your command
+- After answering it goes back to waiting for the wake word
 
-## Configuration
+Say **"exit"**, **"quit"** or **"goodbye"** to stop completely.
 
-Edit the top of `assistant.py`:
+## Configuration (top of assistant.py)
 
 ```python
 OLLAMA_HOST = "http://127.0.0.1:11434"
-MODEL = "qwen2.5:1.5b"          # change to whatever you have
-SYSTEM_PROMPT = "..."           # personality
+MODEL = "qwen2.5:1.5b"
+STT_ENGINE = "google"          # "google" or "whisper"
+WAKE_WORD = "jarvis"
+OWNER_NAME = "Joel"
+ASSISTANT_NAME = "Jarvis"
 ```
 
-## How it works
+## Tools the model can use
 
-1. Listens with microphone (`speech_recognition`)
-2. Transcribes (currently Google STT — easy to swap later for Whisper)
-3. Sends text + conversation history to your local Ollama
-4. Speaks the reply with `pyttsx3` (fully offline)
-5. Can call simple local tools when the model asks for them
+The assistant can trigger these by saying `TOOL: name`:
 
-No Wikipedia, no pywhatkit, no internet required for thinking.
+| Tool            | What it does                  |
+|-----------------|-------------------------------|
+| get_time        | Current time                  |
+| lock_screen     | Lock the session              |
+| open_google     | Open Google                   |
+| open_youtube    | Open YouTube                  |
+| open_url        | Open any URL you mention      |
+| tell_joke       | Random programmer joke        |
+| system_info     | Basic CPU / memory / disk     |
+| exit            | Shut down the assistant       |
+
+You can easily add more tools in the `TOOLS` dict.
+
+## Architecture
+
+1. Wake word detected → listen for command
+2. Speech → text (Google or local Whisper)
+3. Text + history → local Ollama
+4. Reply (or tool) → spoken with pyttsx3 (offline)
+5. Back to wake-word listening
