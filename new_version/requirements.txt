@@ -2,5 +2,6 @@ speechrecognition
 pyttsx3
 ollama
 PyAudio
-# Optional for fully offline speech-to-text:
+
+# Optional — only needed if you want fully offline speech-to-text
 # faster-whisper
